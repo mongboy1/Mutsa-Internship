@@ -1,7 +1,8 @@
-
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+from datetime import datetime
+import openai
 
 st.set_page_config(
     page_title="개인 지출 분석 대시보드",
@@ -11,114 +12,247 @@ st.set_page_config(
 
 st.title("💰 개인 지출 분석 대시보드")
 
-with st.sidebar:
-    st.header("📁 데이터 업로드")
-    uploaded_file = st.file_uploader(
-        "CSV 또는 Excel 파일을 업로드하세요",
-        type=["csv", "xlsx", "xls"]
-    )
-
-def load_and_preprocess(file):
+# =========================
+# 캐시 적용
+# =========================
+@st.cache_data
+def load_data(file):
     if file.name.endswith(".csv"):
         try:
             df = pd.read_csv(file, encoding="utf-8")
-        except UnicodeDecodeError:
+        except:
             file.seek(0)
             df = pd.read_csv(file, encoding="cp949")
     else:
         df = pd.read_excel(file)
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"])
-    df = df[df["amount"] > 0]
-
-    valid_categories = [
-        "식비", "교통비", "카페", "쇼핑",
-        "주거/통신", "구독", "의료/건강",
-        "문화/여가", "교육", "기타"
-    ]
-    df["category"] = df["category"].where(df["category"].isin(valid_categories), "기타")
-    df["description"] = df["description"].fillna("내역 없음")
-    df["is_fixed"] = df["is_fixed"].fillna(False).astype(bool)
-    df["year_month"] = df["date"].dt.strftime("%Y-%m")
-
     return df
 
-if uploaded_file is not None:
-    try:
-        df = load_and_preprocess(uploaded_file)
-        st.success(f"데이터 로드 완료: {len(df)}건")
 
-        with st.sidebar:
-            st.header("🔍 필터")
+def preprocess_data(df):
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    df = df.dropna(subset=["date", "amount"])
+    df = df[df["amount"] > 0]
+    df["description"] = df["description"].fillna("내역 없음")
+    df["is_fixed"] = df["is_fixed"].fillna(False).astype(bool)
+    return df
 
-            min_date = df["date"].min()
-            max_date = df["date"].max()
 
-            date_range = st.date_input(
-                "기간 선택",
-                value=(min_date, max_date),
-                min_value=min_date,
-                max_value=max_date
-            )
+def generate_summary(df):
+    total = df["amount"].sum()
+    avg = df["amount"].mean()
+    max_val = df["amount"].max()
+    count = len(df)
 
-            categories = df["category"].unique().tolist()
-            selected_categories = st.multiselect(
-                "카테고리 선택",
-                options=categories,
-                default=categories
-            )
+    category_df = (
+        df.groupby("category", as_index=False)["amount"]
+        .sum()
+        .sort_values("amount", ascending=False)
+    )
 
-        df_filtered = df.copy()
+    category_df["percentage"] = (
+        category_df["amount"] / total * 100
+    ).round(1)
 
-        if len(date_range) == 2:
-            start_date, end_date = date_range
-            df_filtered = df_filtered[
-                (df_filtered["date"].dt.date >= start_date) &
-                (df_filtered["date"].dt.date <= end_date)
-            ]
+    return {
+        "total": total,
+        "avg": avg,
+        "max": max_val,
+        "count": count,
+        "categories": category_df.to_dict("records")
+    }
 
-        if selected_categories:
-            df_filtered = df_filtered[df_filtered["category"].isin(selected_categories)]
+
+def generate_ai_insight(summary, api_key):
+    openai.api_key = api_key.strip()
+
+    prompt = f"""
+총 지출: {summary['total']:,.0f}원
+평균 지출: {summary['avg']:,.0f}원
+최대 지출: {summary['max']:,.0f}원
+거래 건수: {summary['count']}건
+카테고리별 지출: {summary['categories']}
+
+소비 패턴 분석과 절약 방법, 다음 달 예산 제안을 작성해주세요.
+"""
+
+    response = openai.ChatCompletion.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "당신은 전문 재무 컨설턴트입니다."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7,
+        max_tokens=800
+    )
+
+    return response.choices[0].message.content
+
+
+def recommend_budget(summary):
+    rows = []
+    for cat in summary["categories"]:
+        current = cat["amount"]
+        recommended = int(current * 0.9)
+        rows.append({
+            "카테고리": cat["category"],
+            "현재 지출": current,
+            "권장 예산": recommended,
+            "절약 가능 금액": current - recommended
+        })
+    return pd.DataFrame(rows)
+
+
+def generate_report(summary, insight, budget_df):
+    report = "# 📊 월간 지출 리포트\n\n"
+    report += f"생성일: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+    report += f"- 총 지출: {summary['total']:,.0f}원\n"
+    report += f"- 평균 지출: {summary['avg']:,.0f}원\n"
+    report += f"- 최대 지출: {summary['max']:,.0f}원\n"
+    report += f"- 거래 건수: {summary['count']}건\n\n"
+
+    report += "## 카테고리 분석\n"
+    for cat in summary["categories"]:
+        report += f"- {cat['category']}: {cat['percentage']}% ({cat['amount']:,.0f}원)\n"
+
+    report += "\n## AI 분석\n" + insight + "\n"
+
+    report += "\n## 권장 예산\n"
+    for _, row in budget_df.iterrows():
+        report += f"- {row['카테고리']}: {row['권장 예산']:,.0f}원\n"
+
+    return report
+
+
+# =========================
+# Sidebar 구조 개선
+# =========================
+with st.sidebar:
+
+    st.header("📁 데이터")
+    uploaded = st.file_uploader("CSV 또는 Excel 업로드", type=["csv", "xlsx"])
+
+    st.divider()
+
+    st.header("🤖 AI 설정")
+    api_key = st.text_input("OpenAI API Key", type="password")
+
+if uploaded:
+
+    df = preprocess_data(load_data(uploaded))
+
+    # =========================
+    # 필터
+    # =========================
+    st.sidebar.divider()
+    st.sidebar.header("🔎 필터")
+
+    min_date = df["date"].min()
+    max_date = df["date"].max()
+
+    date_range = st.sidebar.date_input(
+        "기간 선택",
+        value=(min_date, max_date)
+    )
+
+    if len(date_range) == 2:
+        start_date, end_date = date_range
+        df = df[
+            (df["date"].dt.date >= start_date) &
+            (df["date"].dt.date <= end_date)
+        ]
+
+    categories = df["category"].unique().tolist()
+    selected_categories = st.sidebar.multiselect(
+        "카테고리 선택",
+        categories,
+        default=categories
+    )
+
+    df = df[df["category"].isin(selected_categories)]
+
+    summary = generate_summary(df)
+
+    tab1, tab2, tab3 = st.tabs(["📊 대시보드", "🤖 AI 분석", "📄 리포트"])
+
+    # =========================
+    # 대시보드
+    # =========================
+    with tab1:
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("총 지출", f"{summary['total']:,.0f}원")
+        col2.metric("평균 지출", f"{summary['avg']:,.0f}원")
+        col3.metric("최대 지출", f"{summary['max']:,.0f}원")
+        col4.metric("거래 건수", f"{summary['count']}건")
+
+        st.markdown("---")
+
+        cat = df.groupby("category", as_index=False)["amount"].sum()
+
+        fig_pie = px.pie(
+            cat,
+            values="amount",
+            names="category",
+            hole=0.4,
+            color_discrete_sequence=px.colors.qualitative.Set3
+        )
+
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+        df["year_month"] = df["date"].dt.strftime("%Y-%m")
+
+        monthly = df.groupby("year_month", as_index=False)["amount"].sum()
+
+        fig_line = px.line(
+            monthly,
+            x="year_month",
+            y="amount",
+            markers=True
+        )
+
+        st.plotly_chart(fig_line, use_container_width=True)
+
+    # =========================
+    # AI 분석
+    # =========================
+    with tab2:
+
+        if st.button("AI 분석 실행"):
+
+            if not api_key:
+                st.warning("API Key를 입력하세요.")
+            else:
+                with st.spinner("AI 분석 중..."):
+                    insight = generate_ai_insight(summary, api_key)
+                    st.session_state["insight"] = insight
+                    st.markdown(insight)
+
+    # =========================
+    # 리포트
+    # =========================
+    with tab3:
+
+        if "insight" not in st.session_state:
+            st.info("먼저 AI 분석을 실행하세요.")
         else:
-            df_filtered = df_filtered.iloc[0:0]
+            if st.button("리포트 생성"):
+                with st.spinner("리포트 생성 중..."):
 
-        if df_filtered.empty:
-            st.warning("선택한 조건에 해당하는 데이터가 없습니다.")
-        else:
-            st.markdown("## 📊 핵심 지표 (KPI)")
-            col1, col2, col3, col4 = st.columns(4)
+                    budget_df = recommend_budget(summary)
+                    report = generate_report(
+                        summary,
+                        st.session_state["insight"],
+                        budget_df
+                    )
 
-            col1.metric("총 지출", f"{df_filtered['amount'].sum():,.0f} 원")
-            col2.metric("평균 지출", f"{df_filtered['amount'].mean():,.0f} 원")
-            col3.metric("최대 지출", f"{df_filtered['amount'].max():,.0f} 원")
-            col4.metric("거래 건수", f"{len(df_filtered)} 건")
+                    st.markdown(report)
 
-            st.markdown("---")
+                    st.download_button(
+                        "리포트 다운로드 (Markdown)",
+                        report,
+                        "monthly_expense_report.md"
+                    )
 
-            col_left, col_right = st.columns(2)
-
-            with col_left:
-                st.markdown("### 🥧 카테고리별 지출 비율")
-                category_sum = df_filtered.groupby("category")["amount"].sum().reset_index()
-                fig_pie = px.pie(category_sum, values="amount", names="category", hole=0.4)
-                st.plotly_chart(fig_pie, use_container_width=True)
-
-            with col_right:
-                st.markdown("### 📈 월별 지출 추이")
-                monthly_sum = (
-                    df_filtered.groupby("year_month")["amount"]
-                    .sum()
-                    .reset_index()
-                    .sort_values("year_month")
-                )
-                fig_line = px.line(monthly_sum, x="year_month", y="amount", markers=True)
-                st.plotly_chart(fig_line, use_container_width=True)
-
-            with st.expander("📋 전처리된 데이터 미리보기"):
-                st.dataframe(df_filtered.head(20))
-
-    except Exception as e:
-        st.error(f"처리 중 오류가 발생했습니다: {e}")
 else:
-    st.info("왼쪽 사이드바에서 CSV 또는 Excel 파일을 업로드하세요.")
+    st.info("왼쪽 사이드바에서 파일을 업로드하세요.")
